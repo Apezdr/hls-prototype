@@ -2,6 +2,9 @@
 
 This HLS prototype is designed to take a video source file and transcode it into multiple adaptive bitrate (ABR) streams. The transcoder uses FFmpeg and FFprobe to analyze the video file, generate HLS segments, and create playlists for streaming.
 
+The output of this nodejs script has passed Apple's HLS Media Stream Validator (mediastreamvalidator) tool.
+[Using Apple's HTTP Live Streaming (HLS) Tools](https://developer.apple.com/documentation/http-live-streaming/using-apple-s-http-live-streaming-hls-tools)
+
 > Disclaimer: This version does not explicitly support HDR (High Dynamic Range) or Dolby Vision content as of 2/3/2025.
 
 ## Endpoints Overview
