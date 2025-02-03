@@ -65,6 +65,8 @@ The main configuration file is located at `config/config.js` where you can defin
      - To request a video variant, use endpoints such as `/api/stream/my-video/1080p/playlist.m3u8`.
      - For the master playlist, request `/api/stream/my-video/master.m3u8`.
 
+There is a built in cleanup function that will periodically clean up the files produced by the transcode, a cron job that runs every 10 minutes to remove HLS folders that haven’t been accessed in the last 55 minutes.
+
 5. **Cleanup Process:**  
      A scheduled job cleans up unused HLS folders periodically to ensure efficient disk usage.
 
