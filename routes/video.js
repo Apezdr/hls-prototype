@@ -2,14 +2,14 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const { startTranscoding } = require('../services/ffmpegService');
-const { isSessionActive, createSessionLock, updateSessionLock } = require('../services/sessionManager');
+const { handleVideoTranscodingSession } = require('../services/ffmpegService');
 const { VARIANTS, HLS_OUTPUT_DIR, VIDEO_SOURCE_DIR } = require('../config/config');
-const { waitForFileStability } = require('../utils/files');
+const { waitForFileStability, safeFilename } = require('../utils/files');
 var mime = require('mime-types');
 const findVideoFile = require('../utils/findVideoFile');
-const { getMediaInfo } = require('../utils/ffprobe');
+const { getMediaInfo, determineVideoRange } = require('../utils/ffprobe');
 const router = express.Router();
+const fsPromises = fs.promises;
 
 /**
  * GET /api/stream/:id/:variant/playlist.m3u8
@@ -36,7 +36,7 @@ const router = express.Router();
  * @param {object} res - The Express response object.
  * @returns {Promise<void>}
  */
-router.get('/api/stream/:id/:variant/playlist.m3u8', async (req, res) => {
+router.get('/api/stream/:id/:variant/playlist:optionalSuffix?.m3u8', async (req, res) => {
   const videoId = req.params.id;
   const variantLabel = req.params.variant;
 
@@ -56,13 +56,14 @@ router.get('/api/stream/:id/:variant/playlist.m3u8', async (req, res) => {
     return res.status(500).send('No video stream found.');
   }
   const sourceWidth = videoStream.width;
+  const sourceHeight = videoStream.height;
 
   // 3. Build a dynamic variant set
   let variantSet = VARIANTS;
   if (sourceWidth >= 3840) {
     // Add a custom "4k" variant
     variantSet = [
-      { resolution: `${sourceWidth}x${videoStream.height}`, bitrate: '8000k', label: '4k' },
+      { resolution: `${sourceWidth}x${sourceHeight}`, bitrate: '15000k', label: '4k', isSDR: false },
       ...VARIANTS // Also include the standard HD variants
     ];
   }
@@ -74,35 +75,45 @@ router.get('/api/stream/:id/:variant/playlist.m3u8', async (req, res) => {
   }
 
   // 5. Proceed with session checks
-  const outputDir = path.join(HLS_OUTPUT_DIR, videoId, variant.label);
+  const outputDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), variant.label);
   const playlistPath = path.join(outputDir, 'playlist.m3u8');
 
-  if (!isSessionActive(videoId, variant.label)) {
-    createSessionLock(videoId, variant.label);
-    startTranscoding(videoPath, videoId, variant);
-  } else {
-    updateSessionLock(videoId, variant.label);
-  }
+  await handleVideoTranscodingSession(videoId, variant, videoPath);
 
-  if (!fs.existsSync(playlistPath)) {
+  try {
+    await fsPromises.access(playlistPath, fs.constants.F_OK);
+  } catch (err) {
     return res.status(202).send('Playlist not ready, please try again shortly.');
   }
 
-  // 6. Finally, serve the playlist
-  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
   // If you want to transform the playlist content (e.g., remove discontinuity):
-  // const playlistContent = fs.readFileSync(playlistPath, 'utf8');
+  let playlistContent = await fsPromises.readFile(playlistPath, 'utf8');
   // const modifiedPlaylist = playlistContent
   //   .replace('#EXT-X-PLAYLIST-TYPE:EVENT', '#EXT-X-PLAYLIST-TYPE:VOD')
   //   .replace('#EXT-X-VERSION:6', '#EXT-X-VERSION:3')
   //   .replace(/#EXT-X-DISCONTINUITY\n/g, '');
-  // res.send(modifiedPlaylist);
+  
+  // Dynamically determine the video range from the media metadata.
+  const videoRange = determineVideoRange(mediaInfo);
+
+  if (!playlistContent.includes('#EXT-X-VIDEO-RANGE')) {
+    // Insert the video range tag after the version declaration, regardless of the version number.
+    playlistContent = playlistContent.replace(
+      /(#EXT-X-VERSION:[^\n]+\n)/,
+      `$1#EXT-X-VIDEO-RANGE:${videoRange}\n`
+    );
+  }
+  //res.send(modifiedPlaylist);
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (req.query.playlistType === 'VOD') {
+    playlistContent = playlistContent.replace('#EXT-X-PLAYLIST-TYPE:EVENT', '#EXT-X-PLAYLIST-TYPE:VOD');
+  }
+  res.send(Buffer.from(playlistContent, 'utf8'));
 
   // Or just send the file directly:
-  res.sendFile(playlistPath);
+  //res.sendFile(playlistPath);
 });
 
 /**
@@ -132,16 +143,19 @@ router.get('/api/stream/:id/:variant/:segment.ts', async (req, res) => {
   const segmentFile = `${req.params.segment}.ts`;
   const segmentPath = path.join(HLS_OUTPUT_DIR, videoId, variantLabel, segmentFile);
 
-  if (!fs.existsSync(segmentPath)) {
+  try {
+    await fsPromises.access(segmentPath, fs.constants.F_OK);
+  } catch (err) {
     return res.status(404).send('Segment not found.');
   }
 
   try {
-    await waitForFileStability(segmentPath, 200, 5);
+    await waitForFileStability(segmentPath, 200, 600);
     res.setHeader('Content-Type', mime.lookup('.ts'));
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.sendFile(segmentPath);
+    const file = await fsPromises.readFile(segmentPath);
+    res.send(Buffer.from(file, 'utf8'));
   } catch (error) {
     console.error(`Error waiting for file stability on ${segmentFile}:`, error);
     res.status(202).send('Segment not ready, please try again.');

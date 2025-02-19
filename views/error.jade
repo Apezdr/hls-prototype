@@ -1,0 +1,19 @@
+doctype html
+html
+    head
+        title Error
+        meta(charset="utf-8")
+        meta(name="viewport", content="width=device-width, initial-scale=1.0")
+        link(rel="stylesheet", href="/stylesheets/style.css")
+    body
+        .container
+            h1 Something went wrong!
+            if error && error.status
+                h2 Status: #{error.status}
+            if error && error.message
+                p Error Message: #{error.message}
+            else
+                p An unknown error has occurred.
+        //- Hidden content to confuse bots
+        div(style="display:none;")
+            p You should not be here.

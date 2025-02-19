@@ -2,50 +2,66 @@
 const fs = require('fs');
 const path = require('path');
 const { HLS_OUTPUT_DIR } = require('../config/config');
-const { ensureDir } = require('../utils/files');
+const { ensureDir, safeFilename } = require('../utils/files');
+const fsPromises = fs.promises;
 
 /**
  * Returns the path to the session lock file for a given video and variant.
  */
 function getSessionLockPath(videoId, variantLabel) {
-  return path.join(HLS_OUTPUT_DIR, videoId, variantLabel, 'session.lock');
+  return path.join(HLS_OUTPUT_DIR, safeFilename(videoId), variantLabel, 'session.lock');
 }
 
 /**
  * Checks if a session is active by verifying the existence of the lock file.
  */
-function isSessionActive(videoId, variantLabel) {
+async function isSessionActive(videoId, variantLabel) {
   const lockPath = getSessionLockPath(videoId, variantLabel);
-  ensureDir(path.dirname(lockPath));
-  return fs.existsSync(lockPath);
+  await ensureDir(path.dirname(lockPath));
+  try {
+    await fsPromises.access(lockPath);
+    return true;
+  } catch (err) {
+    return false;
+  }
 }
 
 /**
  * Creates a session lock file to indicate that a transcoding session is active.
  */
-function createSessionLock(videoId, variantLabel) {
+async function createSessionLock(videoId, variantLabel) {
   const lockPath = getSessionLockPath(videoId, variantLabel);
-  fs.writeFileSync(lockPath, new Date().toISOString());
+  await ensureDir(path.dirname(lockPath));
+  await fsPromises.writeFile(lockPath, new Date().toISOString());
 }
 
 /**
  * Updates the access and modification time of the lock file.
  */
-function updateSessionLock(videoId, variantLabel) {
+async function updateSessionLock(videoId, variantLabel) {
   const lockPath = getSessionLockPath(videoId, variantLabel);
-  if (fs.existsSync(lockPath)) {
+  try {
+    // Check if file exists by trying to get its stats.
+    await fsPromises.stat(lockPath);
     const now = new Date();
-    fs.utimesSync(lockPath, now, now);
+    await fsPromises.utimes(lockPath, now, now);
+  } catch (err) {
+    // File does not exist; nothing to update.
   }
 }
 
 /**
  * Optionally, remove the session lock file when a session is ended.
  */
-function removeSessionLock(videoId, variantLabel) {
+async function removeSessionLock(videoId, variantLabel) {
   const lockPath = getSessionLockPath(videoId, variantLabel);
-  if (fs.existsSync(lockPath)) {
-    fs.unlinkSync(lockPath);
+  try {
+    await fsPromises.unlink(lockPath);
+  } catch (err) {
+    // Ignore error if file does not exist.
+    if (err.code !== 'ENOENT') {
+      throw err;
+    }
   }
 }
 

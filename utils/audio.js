@@ -2,6 +2,32 @@
 const { spawn } = require('child_process');
 
 /**
+ * Returns FFmpeg filter arguments (e.g. loudnorm) based on channel count.
+ *
+ * Handles both stereo and surround sound scenarios.
+ *
+ * @param {number} channels - The number of audio channels (e.g., 2 for stereo, 6+ for surround).
+ * @param {boolean} applyLoudnorm - Whether to apply loudness normalization.
+ * @returns {string[]} - Array of arguments to be spread into the FFmpeg command.
+ */
+function getAudioFilterArgs(channels, applyLoudnorm = true) {
+  if (!applyLoudnorm) {
+    return [];
+  }
+
+  if (channels === 2) {
+    // Standard loudnorm settings for stereo
+    return ['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'];
+  } else if (channels >= 6) {
+    // Adjusted loudnorm settings for surround sound; these values can be fine-tuned as needed
+    return ['-af', 'loudnorm=I=-23:TP=-2:LRA=7'];
+  } else {
+    // Fallback to stereo settings if channel count is not clearly defined
+    return ['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'];
+  }
+}
+
+/**
  * Uses ffprobe to get the number of channels for a specific audio track.
  * @param {string} videoPath - The full path to the source video file.
  * @param {number|string} audioTrackIndex - The zero-based index of the audio track.
@@ -67,7 +93,7 @@ function getAudioCodec(videoPath, audioTrackIndex) {
  *
  * @param {Object} audioStream - The audio stream object.
  * @param {string} audioStream.codec_name - The name of the codec.
- * @param {string} [audioStream.profile] - The profile of the codec (applicable for AAC).
+ * @param {string} [audioStream.profile] - The profile of the codec (applicable for AAC and TrueHD).
  * @returns {string} The mapped codec string. Returns 'unknown' if the codec is not recognized.
  */
 function mapCodec(audioStream) {
@@ -83,23 +109,39 @@ function mapCodec(audioStream) {
         case 'Dolby TrueHD + Dolby Atmos': 
           return 'mp4a.40.7';
         default:
-          console.warn(`Unknown AAC profile: ${audioStream.profile}`); // Log unknown profiles
-          return 'mp4a.40.2'; // Default back to LC for now
+          console.warn(`Unknown AAC profile: ${audioStream.profile}`);
+          return 'mp4a.40.2';
       }
+      case 'truehd':
+        if (audioStream.profile === 'Dolby TrueHD + Dolby Atmos') {
+          // TrueHD with Atmos
+          return 'mlpa.1.02';
+        } else if (audioStream.profile === 'TrueHD/mlp fba') {
+          // TrueHD / MLP FBA
+          // You can adjust the returned string to meet your needs.
+          return 'truehd';
+        } else {
+          if (audioStream.profile) {
+            console.warn(`Unknown TrueHD profile: ${audioStream.profile}`);
+          }
+          // Plain TrueHD
+          return 'mlpa';
+        }  
     case 'opus':
-      return 'opus'; // Correct codec string for Opus
+      return 'opus';
     case 'mp3':
-      return 'mp4a.40.34'; // Correct codec string for MP3
+      return 'mp4a.40.34';
     case 'ac3':
-      return 'ac-3'; // Correct codec string for AC-3
+    case 'ac-3':
+      return 'ac-3';
     case 'eac3':
-      return 'ec-3'; // Correct codec string for E-AC-3
+      return 'ec-3';
     case 'vorbis':
-      return 'vorbis'; // Correct codec string for Vorbis
+      return 'vorbis';
     case 'flac':
-      return 'flac'; // Correct codec string for FLAC
+      return 'flac';
     default:
-      console.warn(`Unknown codec: ${audioStream.codec_name}`); // Log unknown codecs
+      console.warn(`Unknown codec: ${audioStream.codec_name}`);
       return 'unknown';
   }
 }
@@ -130,6 +172,7 @@ function mapLanguage(lang) {
     'spa': 'es',  // also supports 'esp'
     'esp': 'es',
     'ita': 'it',
+    'ic' : 'isl', // Icelandic
     'por': 'pt',
     'nld': 'nl',  // also supports 'dut'
     'dut': 'nl',
@@ -159,8 +202,11 @@ function mapLanguage(lang) {
     'ukr': 'uk',
     'heb': 'he',
     'mya': 'my',  // Burmese
-    'vie': 'vi'
+    'vie': 'vi',
     // Add more mappings as needed for your project requirements
+
+    // Fallback for undetermined
+    'und': 'und'
   };
 
   if (mappings[lang]) return mappings[lang];
@@ -172,4 +218,4 @@ function mapLanguage(lang) {
   return lang.substring(0, 2);
 }
 
-module.exports = { getAudioChannelCount, getAudioCodec, mapCodec, mapLanguage };
+module.exports = { getAudioFilterArgs, getAudioChannelCount, getAudioCodec, mapCodec, mapLanguage };
