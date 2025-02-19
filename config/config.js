@@ -20,7 +20,7 @@ module.exports = {
   // Folder where temporary HLS segments and playlists will be stored
   HLS_OUTPUT_DIR: process.env.HLS_OUTPUT_DIR ? path.resolve(process.env.HLS_OUTPUT_DIR) : path.join(__dirname, '../tmp/hls'),
   // Video source folder (adjust as needed)
-  VIDEO_SOURCE_DIR: path.join(__dirname, '../media'),
+  VIDEO_SOURCE_DIR: process.env.VIDEO_SOURCE_DIR ? path.resolve(process.env.VIDEO_SOURCE_DIR) : path.join(__dirname, '../media'),
   // FFmpeg executable (if not in PATH, provide full path)
   FFMPEG_PATH: process.env.FFMPEG_PATH ?? 'ffmpeg',
   // ffprobe executable
