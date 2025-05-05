@@ -89,4 +89,13 @@ module.exports = {
   HWACCEL_DECODING_ENABLED: process.env.HWACCEL_DECODING_ENABLED || 'false',
   HWACCEL_TYPE: process.env.HWACCEL_TYPE || 'cuda', // or 'qsv', 'vaapi', etc.
   MAX_HW_PROCESSES: parseInt(process.env.MAX_HW_PROCESSES) || 2,
+  
+  // Just-In-Time Transcoding settings
+  JIT_TRANSCODING_ENABLED: process.env.JIT_TRANSCODING_ENABLED === 'true' ? true : false,
+  JIT_SEGMENT_BUFFER: parseInt(process.env.JIT_SEGMENT_BUFFER) || 5, // Number of segments to generate ahead/behind
+  
+  // Transcoding process management settings
+  TRANSCODING_PAUSE_THRESHOLD: parseInt(process.env.TRANSCODING_PAUSE_THRESHOLD) || 60 * 1000, // 60 seconds before pausing inactive transcoding
+  PRESERVE_SEGMENTS: process.env.PRESERVE_SEGMENTS === 'false' ? false : true, // Default to true: preserve segments when pausing
+  PRESERVE_FFMPEG_PLAYLIST: process.env.PRESERVE_FFMPEG_PLAYLIST === 'false' ? false : true, // Default to true: preserve FFmpeg playlists
 };

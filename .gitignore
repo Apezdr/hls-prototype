@@ -6,3 +6,5 @@ node_modules
 *.bak
 
 *.env
+/test
+/cline_docs

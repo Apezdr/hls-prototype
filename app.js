@@ -9,12 +9,16 @@ var cron = require('node-cron');
 const compression = require('compression');
 var { HLS_OUTPUT_DIR, ENABLE_HLS_CLEANUP } = require('./config/config');
 
-// Import your split route files
+// Import route files
 var videoRoutes = require('./routes/video');
+var videoJitRoutes = require('./routes/video.jit');
 var iframe = require('./routes/iframe');
 var audioRoutes = require('./routes/audio');
+var audioJitRoutes = require('./routes/audio.jit');
 var masterRoutes = require('./routes/master');
+var masterJitRoutes = require('./routes/master.jit');
 const config = require('./config/config');
+const { JIT_TRANSCODING_ENABLED } = require('./config/config');
 
 var app = express();
 
@@ -47,10 +51,19 @@ app.use(express.static(path.join(__dirname, 'public')));
  * Make sure the order won't conflict with your route patterns.
  */
 
-// Example without an added prefix:
-app.use(masterRoutes);
-app.use(audioRoutes);
-app.use(videoRoutes);
+// Apply conditional JIT handling for all routes
+if (JIT_TRANSCODING_ENABLED) {
+  console.log('Using Just-In-Time (JIT) transcoding mode');
+  app.use(audioJitRoutes);  // Use JIT audio segment generation - handles all /api/stream/:id/audio/…
+  app.use(masterJitRoutes); // Use optimized master playlist generation
+  app.use(videoJitRoutes);  // Use JIT video segment generation - only /api/stream/:id/:variant/playlist.m3u8
+} else {
+  console.log('Using standard transcoding mode');
+  app.use(masterRoutes);    // Use standard master playlist generation
+  app.use(videoRoutes);     // Use standard video segment generation
+  app.use(audioRoutes);     // Use standard audio segment generation
+}
+
 app.use(iframe);
 
 // catch 404 and forward to error handler

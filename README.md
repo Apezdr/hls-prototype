@@ -71,3 +71,35 @@ There is a built in cleanup function that will periodically clean up the files p
      A scheduled job cleans up unused HLS folders periodically to ensure efficient disk usage.
 
 This prototype allows you to dynamically generate HLS-streamable content from a given video source with multiple adaptive bitrate options and corresponding audio tracks.
+
+## Just-In-Time (JIT) Transcoding
+
+This prototype now includes Just-In-Time (JIT) transcoding capabilities, allowing users to start playback from any position in a video without waiting for the entire file to be transcoded.
+
+### How JIT Transcoding Works
+
+Traditional HLS transcoding processes a video file from the beginning, which can cause delays when users want to watch from the middle of a video. With JIT transcoding:
+
+1. When a user seeks to a specific position in the video, the HLS player requests the segment containing that position
+2. If the segment doesn't exist, the server automatically starts transcoding from that position
+3. The server returns a "202 Accepted" status while generating the segment
+4. The player automatically retries, and when the segment is ready, playback begins from that position
+
+### Enabling JIT Transcoding
+
+JIT transcoding can be enabled through environment variables:
+
+```
+# In .env.local
+JIT_TRANSCODING_ENABLED="true"
+JIT_SEGMENT_BUFFER="5"  # Number of segments to generate before/after the requested segment
+```
+
+### Benefits of JIT Transcoding
+
+- **Efficient Resource Usage**: Only transcode parts of videos that are actually watched
+- **Fast Seeking**: Start playback from any position without waiting for the entire file to be processed
+- **Standard Player Compatibility**: Works with any HLS-compatible player without modifications
+- **Dynamic Playlist Updates**: Playlists automatically update as segments become available
+
+For detailed documentation, see [docs/JIT-Transcoding.md](docs/JIT-Transcoding.md) and [docs/README-JIT.md](docs/README-JIT.md).
