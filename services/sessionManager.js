@@ -1,73 +1,76 @@
-// services/sessionManager.js
 const fs = require('fs');
 const path = require('path');
 const { HLS_OUTPUT_DIR } = require('../config/config');
 const { ensureDir, safeFilename } = require('../utils/files');
 const fsPromises = fs.promises;
 
-/**
- * Returns the path to the session lock file for a given video and variant.
- */
-function getSessionLockPath(videoId, variantLabel) {
-  return path.join(HLS_OUTPUT_DIR, safeFilename(videoId), variantLabel, 'session.lock');
-}
-
-/**
- * Checks if a session is active by verifying the existence of the lock file.
- */
-async function isSessionActive(videoId, variantLabel) {
-  const lockPath = getSessionLockPath(videoId, variantLabel);
-  await ensureDir(path.dirname(lockPath));
-  try {
-    await fsPromises.access(lockPath);
-    return true;
-  } catch (err) {
-    return false;
+class SessionManager {
+  constructor(outputDir) {
+    this.outputDir = outputDir;
   }
-}
 
-/**
- * Creates a session lock file to indicate that a transcoding session is active.
- */
-async function createSessionLock(videoId, variantLabel) {
-  const lockPath = getSessionLockPath(videoId, variantLabel);
-  await ensureDir(path.dirname(lockPath));
-  await fsPromises.writeFile(lockPath, new Date().toISOString());
-}
-
-/**
- * Updates the access and modification time of the lock file.
- */
-async function updateSessionLock(videoId, variantLabel) {
-  const lockPath = getSessionLockPath(videoId, variantLabel);
-  try {
-    // Check if file exists by trying to get its stats.
-    await fsPromises.stat(lockPath);
-    const now = new Date();
-    await fsPromises.utimes(lockPath, now, now);
-  } catch (err) {
-    // File does not exist; nothing to update.
+  /**
+   * Internal: computes the lock file path for a video variant
+   */
+  getLockPath(videoId, variantLabel) {
+    return path.join(this.outputDir, safeFilename(videoId), variantLabel, 'session.lock');
   }
-}
 
-/**
- * Optionally, remove the session lock file when a session is ended.
- */
-async function removeSessionLock(videoId, variantLabel) {
-  const lockPath = getSessionLockPath(videoId, variantLabel);
-  try {
-    await fsPromises.unlink(lockPath);
-  } catch (err) {
-    // Ignore error if file does not exist.
-    if (err.code !== 'ENOENT') {
-      throw err;
+  /**
+   * Check if a session lock exists
+   */
+  async isSessionActive(videoId, variantLabel) {
+    const lockPath = this.getLockPath(videoId, variantLabel);
+    await ensureDir(path.dirname(lockPath));
+    try {
+      await fsPromises.access(lockPath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Create or refresh a session lock
+   */
+  async createSessionLock(videoId, variantLabel) {
+    const lockPath = this.getLockPath(videoId, variantLabel);
+    await ensureDir(path.dirname(lockPath));
+    await fsPromises.writeFile(lockPath, new Date().toISOString());
+  }
+
+  /**
+   * Update the timestamps on the existing lock (keep it alive)
+   */
+  async updateSessionLock(videoId, variantLabel) {
+    const lockPath = this.getLockPath(videoId, variantLabel);
+    try {
+      const now = new Date();
+      await fsPromises.utimes(lockPath, now, now);
+    } catch {
+      // no-op if lock does not exist
+    }
+  }
+
+  /**
+   * Remove the session lock when session ends
+   */
+  async removeSessionLock(videoId, variantLabel) {
+    const lockPath = this.getLockPath(videoId, variantLabel);
+    try {
+      await fsPromises.unlink(lockPath);
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
     }
   }
 }
 
+// Export a singleton instance
+const sessionManager = new SessionManager(HLS_OUTPUT_DIR);
+
 module.exports = {
-  isSessionActive,
-  createSessionLock,
-  updateSessionLock,
-  removeSessionLock,
+  isSessionActive: sessionManager.isSessionActive.bind(sessionManager),
+  createSessionLock: sessionManager.createSessionLock.bind(sessionManager),
+  updateSessionLock: sessionManager.updateSessionLock.bind(sessionManager),
+  removeSessionLock: sessionManager.removeSessionLock.bind(sessionManager),
 };

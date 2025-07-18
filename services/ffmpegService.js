@@ -1,5 +1,6 @@
 // services/ffmpegService.js
 const path = require('path');
+const fs = require('fs').promises;
 const { spawn } = require('child_process');
 const {
   HLS_OUTPUT_DIR,
@@ -14,20 +15,25 @@ const {
 const { ensureDir, waitForFileStability, safeFilename } = require('../utils/files');
 const { getAudioChannelCount, getAudioCodec, getAudioFilterArgs } = require('../utils/audio');
 const { getMediaInfo, getVideoFps, detectHdrType } = require('../utils/ffprobe');
-const { buildFfmpegArgs } = require('./ffmpegUtils');
+const { buildFfmpegArgs, buildExplicitSegmentFfmpegArgs } = require('./ffmpegUtils');
 const { ensureVideoVariantInfo, ensureAudioVariantInfo, markVariantDone } = require('../utils/manifest');
-const { acquireSlot } = require('./hardwareTranscoderLimiter');
+const { acquireSlot, releaseSlot } = require('./hardwareTranscoderLimiter');
 const { isSessionActive, createSessionLock, updateSessionLock } = require('./sessionManager');
 const findVideoFile = require('../utils/findVideoFile');
+const { generateCodecReference, getSegmentExtensionForVariant, getResolvedCodecForVariant } = require('../utils/codecReferenceUtils');
+const { generateKeyframeTimestampsFileForFfmpeg } = require('../utils/keyframeUtils');
 
 /**
  * Start transcoding a video into HLS segments for a specific variant.
- * After FFmpeg starts producing segments, we wait for the first segment (e.g. "000.ts")
+ * After FFmpeg starts producing segments, we wait for the first segment (e.g. "000.ts" or "000.m4s")
  * to stabilize, run FFprobe on it, and write an info file with measured values.
  */
 async function startTranscoding(videoPath, videoId, variant) {
   const outputDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), variant.label);
   await ensureDir(outputDir);
+
+  // Generate the codec reference file if it doesn't exist
+  await generateCodecReference(videoId, videoPath, [variant]);
 
   // Parse the intended width and height
   const [w, h] = variant.resolution.split('x');
@@ -35,7 +41,7 @@ async function startTranscoding(videoPath, videoId, variant) {
   // detectHdrType could return: "SDR", "HDR10", "HLG", "DolbyVision", etc.
   const isSourceHDR = hdrType !== 'SDR';
 
-  // If the user’s variant config says "force SDR," 
+  // If the user's variant config says "force SDR," 
   // then actually force SDR only if the source is HDR.
   const variantForcedSDR = variant.isSDR && isSourceHDR;
 
@@ -59,6 +65,7 @@ async function startTranscoding(videoPath, videoId, variant) {
     bitrate: variant.bitrate,
     useHardware,
     variantForcedSDR,
+    variant,  // Pass the full variant object for codec selection
   });
 
   console.log(`Starting FFmpeg for variant ${variant.label} with arguments:\n${args.join(' ')}`);
@@ -79,8 +86,13 @@ async function startTranscoding(videoPath, videoId, variant) {
     }
   });
 
+  // Get the appropriate extension for this variant from the codec reference
+  const extension = await getSegmentExtensionForVariant(videoId, variant.label);
+  
   // Wait for the first segment file to stabilize, then gather info
-  const segmentFile = path.join(outputDir, '000.ts');
+  const segmentFile = path.join(outputDir, `000.${extension}`);
+  console.log(`Waiting for first segment file to stabilize: ${segmentFile}`);
+  
   waitForFileStability(segmentFile, 200, 600)
     .then(() => getMediaInfo(segmentFile))
     .then(async (segmentInfo) => {
@@ -95,7 +107,7 @@ async function startTranscoding(videoPath, videoId, variant) {
     });
 }
 
-async function startAudioTranscoding(videoPath, videoId, audioTrackIndex, audioVariantLabel, requested_codec) {
+async function startAudioTranscoding(videoPath, videoId, audioTrackIndex, audioVariantLabel, requested_codec, startNumber = 0) {
     const outputDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), audioVariantLabel);
     await ensureDir(outputDir);
   
@@ -209,13 +221,35 @@ async function startAudioTranscoding(videoPath, videoId, audioTrackIndex, audioV
     const hlsFlags = 
       "append_list+temp_file" + (HLS_IFRAME_ENABLED ? "+independent_segments" : "+split_by_time");
   
-    const args = [
-      '-i', videoPath,
+  // Calculate the start time based on segment number if provided
+  let startTime = 0;
+  if (startNumber > 0) {
+    startTime = startNumber * HLS_SEGMENT_TIME;
+    console.log(`Starting audio transcoding at segment ${startNumber} (${startTime}s)`);
+  }
+
+  // Add arguments before input
+  const args = [
+    '-copyts',
+    '-avoid_negative_ts', 'disabled',
+  ];
+  
+  // Add seek parameter BEFORE input if starting from non-zero segment
+  if (startTime > 0) {
+    args.push('-ss', startTime.toString());
+  }
+  
+  args.push(
+    '-i', videoPath,
       // Map the requested audio track (0-based index)
       '-map', `0:a:${audioTrackIndex}`,
       '-c:a', audioCodecArg,
+      // Add -start_at_zero for ALL modes to reset timestamps at segment boundaries
+      '-start_at_zero',
       ...codecOpts,
       '-f', 'hls',
+      // Add -copyts for output too
+      '-copyts',
       '-hls_list_size', '0',
       "-hls_init_time", `${HLS_SEGMENT_TIME}`,
       //'-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
@@ -230,7 +264,7 @@ async function startAudioTranscoding(videoPath, videoId, audioTrackIndex, audioV
       '-hls_flags', hlsFlags,
       '-hls_segment_filename', path.join(outputDir, '%03d.ts'),
       path.join(outputDir, 'playlist.m3u8')
-    ];
+    );
   
     console.log(`Starting FFmpeg audio transcoding for ${audioVariantLabel} with args:`);
     console.log(args.join(' '));
@@ -273,7 +307,7 @@ async function startAudioTranscoding(videoPath, videoId, audioTrackIndex, audioV
  * @param {string} videoId - The video identifier.
  * @param {string} audioVariantLabel - The label for this audio variant (e.g., "stereo").
  */
-async function startStereoAudioTranscoding(videoPath, videoId, audioVariantLabel) {
+async function startStereoAudioTranscoding(videoPath, videoId, audioVariantLabel, startNumber = 0) {
   const outputDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), audioVariantLabel);
   await ensureDir(outputDir);
   
@@ -293,7 +327,25 @@ async function startStereoAudioTranscoding(videoPath, videoId, audioVariantLabel
   const hlsFlags = 
       "append_list+temp_file" + (HLS_IFRAME_ENABLED ? "+independent_segments" : "+split_by_time");
   
+  // Calculate start time based on segment number if provided
+  let startTime = 0;
+  if (startNumber > 0) {
+    startTime = startNumber * HLS_SEGMENT_TIME;
+    console.log(`Starting stereo audio transcoding at segment ${startNumber} (${startTime}s)`);
+  }
+
+  // Add arguments before input
   const args = [
+    '-copyts',
+    '-avoid_negative_ts', 'disabled'
+  ];
+  
+  // Add seek parameter BEFORE input if starting from non-zero segment
+  if (startTime > 0) {
+    args.push('-ss', startTime.toString());
+  }
+  
+  args.push(
     '-i', videoPath,
     // Map the first audio track (0-based index) from the source.
     '-map', '0:a:0',
@@ -302,13 +354,15 @@ async function startStereoAudioTranscoding(videoPath, videoId, audioVariantLabel
     '-b:a', bitRate,
     ...filterArgs,
     '-flags', '+cgop',
+    // Add -copyts for output too
+    '-copyts',
     '-force_key_frames', `expr:gte(t,n_forced*${HLS_SEGMENT_TIME})`,
     '-hls_time', `${HLS_SEGMENT_TIME}`,
     '-hls_playlist_type', 'event',
     '-hls_flags', hlsFlags,
     '-hls_segment_filename', path.join(outputDir, '%03d.ts'),
     path.join(outputDir, 'playlist.m3u8')
-  ];
+  );
   
   console.log(`Starting FFmpeg stereo audio transcoding for ${audioVariantLabel} with args:`);
   console.log(args.join(' '));
@@ -358,10 +412,11 @@ async function startStereoAudioTranscoding(videoPath, videoId, audioVariantLabel
  * @param {number} i - The index of the specific audio track or step in the process.
  * @param {string} codecName - The name of the codec to use for transcoding.
  * @param {string} [type=null] - The type of audio transcoding process to start (e.g., "stereo").
+ * @param {number} [startNumber=0] - The starting segment number for the transcoding process.
  * @returns {Promise<void>} A promise that resolves when the audio transcoding session handling is complete.
  * @throws {Error} Logs an error to the console if the audio transcoding process fails.
  */
-async function handleAudioTranscodingSession(videoId, audioVariantLabel, i, codecName, type = null) {
+async function handleAudioTranscodingSession(videoId, audioVariantLabel, i, codecName, type = null, startNumber = 0) {
   try {
     if (!await isSessionActive(videoId, audioVariantLabel)) {
       await createSessionLock(videoId, audioVariantLabel);
@@ -369,7 +424,7 @@ async function handleAudioTranscodingSession(videoId, audioVariantLabel, i, code
       if (type === "stereo") {
         await startStereoAudioTranscoding(videoPath, videoId, audioVariantLabel);
       } else {
-        await startAudioTranscoding(videoPath, videoId, i, audioVariantLabel, codecName);
+        await startAudioTranscoding(videoPath, videoId, i, audioVariantLabel, codecName, startNumber);
       }
     } else {
       await updateSessionLock(videoId, audioVariantLabel);
@@ -408,4 +463,276 @@ async function handleVideoTranscodingSession(videoId, variant, videoPath) {
   }
 }
 
-module.exports = { startTranscoding, startAudioTranscoding, startStereoAudioTranscoding, handleAudioTranscodingSession, handleVideoTranscodingSession };
+/**
+ * Transcode a single video segment with explicit offsets
+ * @param {string} videoId - Video identifier
+ * @param {object} variant - Variant information
+ * @param {string} videoPath - Path to source video
+ * @param {number} segmentNumber - Segment number
+ * @param {number} runtimeTicks - Start time in ticks (100ns units)
+ * @param {number} durationTicks - Duration in ticks (100ns units)
+ * @returns {Promise<string>} - Path to the transcoded segment
+ */
+async function transcodeExplicitSegment(videoId, variant, videoPath, segmentNumber, runtimeTicks, durationTicks) {
+  const taskId = `${videoId}_${variant.label}_${segmentNumber}`;
+  const outputDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), variant.label);
+  await ensureDir(outputDir);
+  
+  // Convert ticks to seconds
+  const startTime = runtimeTicks / 10000000;
+  const duration = durationTicks / 10000000;
+  
+  // Get the extension for this variant
+  const ext = await getSegmentExtensionForVariant(videoId, variant.label) || 'ts';
+  const segmentFile = `${segmentNumber.toString().padStart(3, '0')}.${ext}`;
+  const segmentPath = path.join(outputDir, segmentFile);
+  
+  // Check if segment already exists
+  try {
+    await fs.access(segmentPath);
+    console.log(`Segment ${segmentNumber} already exists at ${segmentPath}`);
+    return segmentPath; // Segment already exists
+  } catch {
+    // Need to transcode
+    console.log(`Segment ${segmentNumber} doesn't exist, transcoding now...`);
+  }
+  
+  // Parse resolution
+  const [w, h] = variant.resolution.split('x');
+  
+  // Determine if hardware encoding can be used
+  let useHardware = false;
+  if (HARDWARE_ENCODING_ENABLED === "true") {
+    try {
+      if (await acquireSlot({ taskId })) {
+        useHardware = true;
+        console.log(`Hardware slot acquired for explicit segment ${segmentNumber}`);
+      }
+    } catch (err) {
+      console.warn(`Could not acquire hardware slot: ${err.message}`);
+    }
+  }
+  
+  // Track hardware slot usage to ensure it's released in all cases
+  let hardwareSlotReleased = false;
+  const keyframeExpression = await generateKeyframeTimestampsFileForFfmpeg(videoId);
+
+  // Generate codec reference file if it doesn't exist
+  await generateCodecReference(videoId, videoPath, [variant]);
+  
+  try {
+    // Get HDR type
+    const hdrType = detectHdrType(await getMediaInfo(videoPath, 'ffprobe'));
+    const isSourceHDR = hdrType !== 'SDR';
+    const variantForcedSDR = variant.isSDR && isSourceHDR;
+    
+    // Build FFmpeg args for this segment
+    const args = await buildExplicitSegmentFfmpegArgs({
+      videoPath,
+      outputPath: segmentPath,
+      startTime,
+      duration,
+      width: w,
+      height: h,
+      bitrate: variant.bitrate,
+      useHardware,
+      variantForcedSDR,
+      variant,
+      keyframeTimestamps: keyframeExpression,
+    });
+    
+    console.log(`Transcoding segment ${segmentNumber} with explicit offsets: start=${startTime}s, duration=${duration}s`);
+    
+    // Run FFmpeg
+    const ffmpeg = spawn(FFMPEG_PATH, args);
+
+    // Console log the FFmpeg command for debugging
+    console.log(`FFmpeg command for segment ${segmentNumber}:`);
+    console.log(FFMPEG_PATH, args.join(' '));
+    
+    // Collect stderr for analysis
+    let stderrOutput = '';
+    
+    // Wait for completion
+    await new Promise((resolve, reject) => {
+      ffmpeg.stderr.on('data', (data) => {
+        const dataStr = data.toString();
+        stderrOutput += dataStr;
+        console.log(`FFmpeg (explicit segment) stderr: ${dataStr}`);
+      });
+      
+      ffmpeg.on('close', code => {
+        if (code === 0) {
+          // Check for empty file warning in the output
+          if (stderrOutput.includes('Output file is empty') || 
+              stderrOutput.includes('nothing was encoded')) {
+            console.warn(`Warning: FFmpeg produced empty output for segment ${segmentNumber}`);
+            // We still resolve as this is not a fatal error
+          }
+          console.log(`Successfully transcoded segment ${segmentNumber}`);
+          resolve();
+        } else {
+          console.error(`FFmpeg exited with code ${code}`);
+          reject(new Error(`FFmpeg exited with code ${code}`));
+        }
+      });
+    });
+    
+    // Check if the file exists and has content
+    try {
+      const stats = await fs.stat(segmentPath);
+      if (stats.size === 0) {
+        console.warn(`Warning: Generated segment file is empty: ${segmentPath}`);
+        throw new Error('FFmpeg produced an empty output file');
+      }
+    } catch (err) {
+      console.warn(`Problem with output file: ${err.message}`);
+      throw new Error(`Segment generation failed: ${err.message}`);
+    }
+    
+    // Ensure file stability
+    try {
+      await waitForFileStability(segmentPath, 200, 5000);
+    } catch (err) {
+      console.warn(`File stability check failed: ${err.message}`);
+      // Continue anyway since the file exists and has content
+    }
+    
+    return segmentPath;
+  } catch (error) {
+    console.error(`Error during explicit segment transcoding: ${error.message}`);
+    throw error;
+  } finally {
+    // Always release hardware slot if it was acquired, regardless of outcome
+    if (useHardware && !hardwareSlotReleased) {
+      try {
+        releaseSlot(taskId);
+        hardwareSlotReleased = true;
+        console.log(`Hardware slot released by task ${taskId} (in finally block)`);
+      } catch (err) {
+        console.error(`Failed to release hardware slot: ${err.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * Transcode a single audio segment with explicit offsets
+ * @param {string} videoId - Video identifier
+ * @param {object} audioVariant - Audio variant information
+ * @param {string} videoPath - Path to source video
+ * @param {number} segmentNumber - Segment number
+ * @param {number} runtimeTicks - Start time in ticks (100ns units)
+ * @param {number} durationTicks - Duration in ticks (100ns units)
+ * @returns {Promise<string>} - Path to the transcoded segment
+ */
+async function transcodeExplicitAudioSegment(videoId, audioVariant, videoPath, segmentNumber, runtimeTicks, durationTicks) {
+  const outputDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), audioVariant.label);
+  await ensureDir(outputDir);
+  
+  // Convert ticks to seconds
+  const startTime = runtimeTicks / 10000000;
+  const duration = durationTicks / 10000000;
+  
+  // Always use .ts for audio segments
+  const segmentFile = `${segmentNumber.toString().padStart(3, '0')}.ts`;
+  const segmentPath = path.join(outputDir, segmentFile);
+  
+  // Check if segment already exists
+  try {
+    await fs.access(segmentPath);
+    return segmentPath; // Segment already exists
+  } catch {
+    // Need to transcode
+    console.log(`Audio segment ${segmentNumber} doesn't exist, transcoding now...`);
+  }
+  
+  // Get audio details
+  let channels, originalAudioCodec;
+  try {
+    channels = await getAudioChannelCount(videoPath, audioVariant.trackIndex);
+    originalAudioCodec = await getAudioCodec(videoPath, audioVariant.trackIndex);
+  } catch (err) {
+    console.error("Error retrieving audio info, using defaults:", err);
+    channels = 2;
+    originalAudioCodec = 'aac';
+  }
+  
+  // Determine audio codec to use
+  let audioCodecArg, filterArgs = [];
+  if (audioVariant.codec && audioVariant.codec.toLowerCase() === originalAudioCodec.toLowerCase()) {
+    audioCodecArg = 'copy';
+  } else {
+    audioCodecArg = WEB_SUPPORTED_CODECS.includes(audioVariant.codec?.toLowerCase()) 
+      ? audioVariant.codec.toLowerCase() 
+      : 'aac';
+    filterArgs = getAudioFilterArgs(channels, true);
+  }
+
+  // Audio doesn't need keyframes - this directly causes sync issues
+
+  // Build the FFmpeg command for audio
+  const args = [
+    '-copyts',
+    '-avoid_negative_ts', 'disabled',
+    '-start_at_zero',
+    '-ss', startTime.toString(),
+    '-i', videoPath,
+    '-t', duration.toString(),
+    //'-force_key_frames', 'expr:gte(t,0)',
+    '-map', `0:a:${audioVariant.trackIndex}`,
+    '-c:a', audioCodecArg,
+  ];
+
+  // Audio doesn't need scene change detection - removed keyframe logic
+  
+  // Only add these arguments if we're not copying the stream
+  if (audioCodecArg !== 'copy') {
+    const bitRate = channels > 2 ? '384k' : '128k';
+    args.push(
+      '-ac', channels.toString(),
+      '-b:a', bitRate,
+      ...filterArgs
+    );
+  }
+  
+  // Output format and file
+  args.push('-f', 'mpegts', segmentPath);
+  
+  console.log(`Transcoding audio segment ${segmentNumber} with explicit offsets: start=${startTime}s, duration=${duration}s`);
+  
+  // Run FFmpeg
+  const ffmpeg = spawn(FFMPEG_PATH, args);
+  
+  // Wait for completion
+  await new Promise((resolve, reject) => {
+    ffmpeg.stderr.on('data', (data) => {
+      console.log(`FFmpeg audio segment stderr: ${data}`);
+    });
+    
+    ffmpeg.on('close', code => {
+      if (code === 0) {
+        console.log(`Successfully transcoded audio segment ${segmentNumber}`);
+        resolve();
+      } else {
+        console.error(`FFmpeg exited with code ${code}`);
+        reject(new Error(`FFmpeg exited with code ${code}`));
+      }
+    });
+  });
+  
+  // Ensure file stability
+  await waitForFileStability(segmentPath, 200, 5000);
+  
+  return segmentPath;
+}
+
+module.exports = { 
+  startTranscoding, 
+  startAudioTranscoding, 
+  startStereoAudioTranscoding, 
+  handleAudioTranscodingSession, 
+  handleVideoTranscodingSession,
+  transcodeExplicitSegment,
+  transcodeExplicitAudioSegment
+};

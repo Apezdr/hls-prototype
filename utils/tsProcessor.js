@@ -10,6 +10,10 @@ const { safeFilename } = require('./files');
  */
 const ccStateStore = new Map();
 
+// Track segment durations to detect significant changes
+// Structure: { [videoId_variantLabel]: { segmentNumber: duration } }
+const segmentDurationStore = new Map();
+
 /**
  * Process a TS segment to adjust continuity counters based on previous segment's ending values.
  * @param {string} videoId - Unique identifier for the video
@@ -20,16 +24,50 @@ const ccStateStore = new Map();
  */
 async function processTsSegment(videoId, variantLabel, segmentPath, segmentNumber) {
   try {
+    // Skip processing for fMP4 segments
+    if (segmentPath.endsWith('.m4s')) {
+      console.log(`Skipping TS continuity processing for fMP4 segment: ${segmentPath}`);
+      return;
+    }
+    
     // Skip processing for the first segment (segment 0)
     if (segmentNumber === 0) {
       // For first segment, just parse it to store the final CC values
       await updateCcState(videoId, variantLabel, segmentPath);
+      console.log(`Initialized CC state for first segment of ${videoId}_${variantLabel}`);
       return;
     }
 
     // Get the stored CC state from the previous segment
     const stateKey = `${videoId}_${variantLabel}`;
     const previousCcState = ccStateStore.get(stateKey) || {};
+    
+    // Determine if this is a transition segment with duration change
+    let isTransition = false;
+    try {
+      const duration = await extractSegmentDuration(segmentPath);
+      const durationStore = segmentDurationStore.get(stateKey) || {};
+      
+      // Store this segment's duration
+      durationStore[segmentNumber] = duration;
+      
+      // Check for significant duration change from previous segment
+      const prevDuration = durationStore[segmentNumber - 1];
+      if (prevDuration && duration) {
+        // Calculate percentage change
+        const percentChange = Math.abs(duration - prevDuration) / prevDuration * 100;
+        
+        // If duration changed by more than 20%, consider it a transition segment
+        if (percentChange > 20) {
+          isTransition = true;
+          console.log(`Detected segment transition: Duration changed by ${percentChange.toFixed(2)}% (${prevDuration.toFixed(3)}s → ${duration.toFixed(3)}s) at segment ${segmentNumber}`);
+        }
+      }
+      
+      segmentDurationStore.set(stateKey, durationStore);
+    } catch (error) {
+      console.warn(`Unable to check segment duration for transition detection: ${error.message}`);
+    }
     
     if (Object.keys(previousCcState).length === 0) {
       console.log(`No previous CC state found for ${stateKey}. Skipping adjustment.`);
@@ -38,55 +76,56 @@ async function processTsSegment(videoId, variantLabel, segmentPath, segmentNumbe
       return;
     }
 
+    // Apply more aggressive processing for transition segments
+    if (isTransition) {
+      console.log(`Applying enhanced TS processing for transition segment ${segmentNumber}`);
+    }
+
     // 1. Read the segment file
     const segmentBuffer = await fs.readFile(segmentPath);
     
     // 2. Process the segment with mux.js
     const { adjustedBuffer, finalCcState } = await adjustContinuityCounters(
       segmentBuffer, 
-      previousCcState
+      previousCcState,
+      isTransition
     );
     
-    // 3. Write the processed segment to a temporary file first
-    const tempPath = `${segmentPath}.tmp.processed`;
-    await fs.writeFile(tempPath, Buffer.from(adjustedBuffer));
+    // 3. Create a temporary file with a unique name that won't conflict
+    const tempFilename = `.__tmp_${Date.now()}_${Math.floor(Math.random() * 10000)}.ts`;
+    const tempPath = path.join(path.dirname(segmentPath), tempFilename);
     
-    // 4. Try to atomically replace the original file with the processed one
+    // 4. Write the adjusted buffer to the temp file first
     try {
-      await fs.rename(tempPath, segmentPath);
-    } catch (renameError) {
-      if (renameError.code === 'EPERM' || renameError.code === 'EBUSY') {
-        console.log(`File ${segmentPath} is locked, cannot replace. Using a copy approach instead.`);
+      await fs.writeFile(tempPath, Buffer.from(adjustedBuffer));
+      
+      // 5. Now try to replace the original file with the temp file
+      try {
+        // On Windows, we need to handle the case where the file might be locked
+        // On Linux, this should work most of the time
+        await fs.unlink(segmentPath);
+        await fs.rename(tempPath, segmentPath);
+        console.log(`Successfully replaced segment with fixed continuity counters: ${segmentPath}`);
+      } catch (replaceError) {
+        // If we can't replace the file, don't worry - we'll just use the original
+        // This could happen if another process is reading the file
+        console.warn(`Could not replace segment file (may be locked): ${replaceError.message}`);
         
+        // Clean up temp file so we don't leave junk behind
         try {
-          // Alternative approach: create a copy with a different name in the same directory
-          const segDir = path.dirname(segmentPath);
-          const segFilename = path.basename(segmentPath);
-          const processedPath = path.join(segDir, `processed_${segFilename}`);
-          
-          // Copy the processed file instead of renaming
-          await fs.copyFile(tempPath, processedPath);
-          
-          // Update the segment path for state tracking
-          console.log(`Successfully copied processed segment to ${processedPath}`);
-          
-          // Clean up temp file
-          try {
-            await fs.unlink(tempPath);
-          } catch (unlinkError) {
-            // Ignore errors when deleting temp file
-          }
-          
-          // Return early - we've stored the CC state and will use it for the next segment
-          return;
-        } catch (copyError) {
-          console.error(`Error creating processed copy: ${copyError.message}`);
-          // Continue to normal error handling
+          await fs.unlink(tempPath);
+        } catch (unlinkError) {
+          // Ignore errors when deleting temp file
         }
       }
-      
-      // Re-throw any other errors
-      throw renameError;
+    } catch (writeError) {
+      console.error(`Error writing temporary segment: ${writeError.message}`);
+      // Clean up temp file if it exists
+      try {
+        await fs.unlink(tempPath);
+      } catch (unlinkError) {
+        // Ignore errors when deleting temp file
+      }
     }
     
     // 5. Update the CC state store with the final values from this segment
@@ -198,17 +237,101 @@ function extractFinalCcValues(tsBuffer) {
 }
 
 /**
+ * Extract segment duration from a TS file
+ * @param {string} segmentPath - Path to the segment file
+ * @returns {Promise<number>} - Duration in seconds
+ */
+async function extractSegmentDuration(segmentPath) {
+  try {
+    const segmentBuffer = await fs.readFile(segmentPath);
+    const segmentName = path.basename(segmentPath);
+    
+    // Parse timestamps from the segment
+    let firstPts = null;
+    let lastPts = null;
+    let ptsFound = false;
+    
+    // Create streams for processing with ElementaryStream to better extract PTS values
+    const packetStream = new muxjs.mp2t.TransportPacketStream();
+    const parser = new muxjs.mp2t.TransportParseStream();
+    const elementary = new muxjs.mp2t.ElementaryStream();
+    const timestampParser = new muxjs.mp2t.TimestampRolloverStream();
+    
+    // Connect the streams
+    packetStream.pipe(parser).pipe(elementary).pipe(timestampParser);
+    
+    // Look for PTS values in the stream
+    timestampParser.on('data', (data) => {
+      if (!data || !data.pts) return;
+      
+      ptsFound = true;
+      
+      if (firstPts === null) {
+        firstPts = data.pts;
+      }
+      
+      // Always update lastPts to get the latest value
+      lastPts = data.pts;
+    });
+    
+    // Process the entire buffer
+    const packetSize = 188; // MPEG-TS packet size
+    for (let i = 0; i < segmentBuffer.length; i += packetSize) {
+      if (i + packetSize <= segmentBuffer.length) {
+        packetStream.push(segmentBuffer.subarray(i, i + packetSize));
+      }
+    }
+    packetStream.flush();
+    elementary.flush(); // Ensure all elementary stream data is flushed
+    
+    // Log the results for debugging
+    console.log(`Segment ${segmentName}: PTS found: ${ptsFound}, First PTS: ${firstPts}, Last PTS: ${lastPts}`);
+    
+    // Calculate duration
+    if (firstPts !== null && lastPts !== null) {
+      // Handle PTS wraparound (PTS is a 33-bit value that wraps around)
+      let duration;
+      if (lastPts < firstPts) {
+        // PTS wrapped around
+        duration = ((8589934592 - firstPts) + lastPts) / 90000; // 2^33 = 8589934592, 90kHz clock
+      } else {
+        duration = (lastPts - firstPts) / 90000;
+      }
+      
+      // Handle invalid durations
+      if (isNaN(duration) || duration <= 0 || duration > 60) {
+        throw new Error(`Invalid segment duration: ${duration}s`);
+      }
+      
+      return duration;
+    }
+    
+    console.warn(`Segment ${segmentName}: Could not determine segment duration, no valid PTS values found`);
+    // Return a default duration of 4 seconds to ensure transition detection still works
+    return 4.0;
+  } catch (error) {
+    console.warn(`Error extracting segment duration from ${segmentName}: ${error.message}`);
+    // Return a default duration instead of null to ensure transition detection still works
+    return 4.0;
+  }
+}
+
+/**
  * Adjust continuity counters in a TS segment buffer
  * @param {Buffer} tsBuffer - Original TS file buffer
  * @param {Object} previousCcState - Object mapping PIDs to their final CC values from previous segment
+ * @param {boolean} isTransition - Whether this segment is a transition segment
  * @returns {Promise<Object>} - Object containing the adjusted buffer and final CC state
  */
-function adjustContinuityCounters(tsBuffer, previousCcState) {
+function adjustContinuityCounters(tsBuffer, previousCcState, isTransition = false) {
   return new Promise((resolve) => {
     const packetSize = 188; // MPEG-TS packet size
     const outputBuffers = [];
     const finalCcState = { ...previousCcState }; // Start with previous state
     const pidFirstCcValues = {}; // To track the first CC per PID in this segment
+    
+    // For transition segments, we'll keep track of PIDs that need special handling
+    const transitionPids = new Set();
     
     // Create streams for processing
     const packetStream = new muxjs.mp2t.TransportPacketStream();
@@ -291,16 +414,48 @@ function adjustContinuityCounters(tsBuffer, previousCcState) {
           // For the first packet of this PID in the segment, we want to ensure it
           // continues directly from the last CC value of the previous segment
           if (currentCc === pidFirstCcValues[pid]) {
-            // This is the first packet for this PID, so just increment from previous segment's last CC
-            const newCc = (previousCcState[pid] + 1) % 16;
-            headerBytes[3] = (headerBytes[3] & 0xf0) | newCc;
-            finalCcState[pid] = newCc;
+            // This is the first packet for this PID, so increment from previous segment's last CC
+            
+            // For transition segments, use a more aggressive approach to ensure clean continuity
+            if (isTransition) {
+              // Mark this PID as needing special treatment
+              transitionPids.add(pid);
+              
+              // For transition segments, we force a double increment to create clear separation
+              // between the non-transition and transition segments. This helps players recognize
+              // the boundary more clearly.
+              const newCc = (previousCcState[pid] + 2) % 16;
+              headerBytes[3] = (headerBytes[3] & 0xf0) | newCc;
+              finalCcState[pid] = newCc;
+              
+              // If this is a video PID (generally not 0 or in the range 16-31)
+              if (pid !== 0 && (pid < 16 || pid > 31)) {
+                // Log special handling for video PIDs which tend to be most problematic
+                console.log(`Applied transition handling for video PID ${pid}: previous CC ${previousCcState[pid]} → new CC ${newCc}`);
+              }
+            } else {
+              // Normal handling for non-transition segments
+              const newCc = (previousCcState[pid] + 1) % 16;
+              headerBytes[3] = (headerBytes[3] & 0xf0) | newCc;
+              finalCcState[pid] = newCc;
+            }
           } else {
             // For subsequent packets, preserve the increment pattern from the first packet
             const ccIncrement = (currentCc - pidFirstCcValues[pid] + 16) % 16;
-            const newCc = (previousCcState[pid] + 1 + ccIncrement) % 16;
-            headerBytes[3] = (headerBytes[3] & 0xf0) | newCc;
-            finalCcState[pid] = newCc;
+            
+            // For transition segments with PIDs we've marked, maintain the special handling
+            if (isTransition && transitionPids.has(pid)) {
+              // For marked PIDs in transition segments, we add an extra increment
+              // to maintain the double-increment pattern established for the first packet
+              const newCc = (previousCcState[pid] + 1 + ccIncrement + 1) % 16;
+              headerBytes[3] = (headerBytes[3] & 0xf0) | newCc;
+              finalCcState[pid] = newCc;
+            } else {
+              // Normal handling for non-transition segments
+              const newCc = (previousCcState[pid] + 1 + ccIncrement) % 16;
+              headerBytes[3] = (headerBytes[3] & 0xf0) | newCc;
+              finalCcState[pid] = newCc;
+            }
           }
         } catch (error) {
           console.warn(`Error updating CC for PID ${pid}: ${error.message}`);

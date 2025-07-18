@@ -44,24 +44,23 @@ module.exports = {
   HLS_IFRAME_ENABLED: process.env.HLS_IFRAME_ENABLED === "true" ? true : false,
   // List of variant qualities to support
   VARIANTS: [
-    { resolution: '-1x1080', bitrate: '8000k', label: '1080p', isSDR: false },
-    { resolution: '-1x720', bitrate: '4000k', label: '720p', isSDR: true },
-    //{ resolution: '1920x1080', bitrate: '8000k', label: '1080p', isSDR: false },
-    //{ resolution: '1280x720', bitrate: '4000k', label: '720p', isSDR: true },
-    //{ resolution: '960x540', bitrate: '2000k', label: '540p', isSDR: true },
-    //
-    // { resolution: '1920x1080', bitrate: '8000k', label: '1080p High' },
-    // { resolution: '1920x1080', bitrate: '5000k', label: '1080p Medium' },
-    // { resolution: '1280x720', bitrate: '4000k', label: '720p High' },
-    // { resolution: '1280x720', bitrate: '2500k', label: '720p Medium' },
-    // { resolution: '960x540', bitrate: '2000k', label: '540p High' },
-    // { resolution: '960x540', bitrate: '1200k', label: '540p Medium' },
-    // { resolution: '640x360', bitrate: '1000k', label: '360p High' },
-    // { resolution: '640x360', bitrate: '600k', label: '360p Medium' },
-    // { resolution: '480x270', bitrate: '500k', label: '270p High' },
-    // { resolution: '480x270', bitrate: '300k', label: '270p Medium' },
-    // { resolution: '320x180', bitrate: '250k', label: '180p High' },
-    // { resolution: '320x180', bitrate: '150k', label: '180p Medium' }
+    { resolution: '-1x2160', bitrate: '16000k', label: '4K', isSDR: false, codec: 'source' },
+    { resolution: '-1x1080', bitrate: '8000k', label: '1080p', isSDR: false, codec: 'optimal' },
+    { resolution: '-1x720', bitrate: '4000k', label: '720p', isSDR: true, codec: 'h264' },
+    // Modern codec variants with lower bitrates for the same quality
+    //{ resolution: '-1x2160', bitrate: '12000k', label: '4K HEVC', isSDR: false, codec: 'hevc' },
+    //{ resolution: '-1x1080', bitrate: '5000k', label: '1080p HEVC', isSDR: false, codec: 'hevc' },
+    
+    // Commented examples
+    //{ resolution: '1920x1080', bitrate: '8000k', label: '1080p', isSDR: false, codec: 'source' },
+    //{ resolution: '1280x720', bitrate: '4000k', label: '720p', isSDR: true, codec: 'h264' },
+    //{ resolution: '960x540', bitrate: '2000k', label: '540p', isSDR: true, codec: 'h264' },
+    
+    // HDR-aware codec selection
+    //{ resolution: '-1x2160', bitrate: '15000k', label: '4K HDR', isSDR: false, codec: 'hdrAware' },
+    
+    // AV1 for efficient encoding at high quality
+    //{ resolution: '-1x1080', bitrate: '4000k', label: '1080p AV1', isSDR: false, codec: 'av1' },
   ],
   // Scoring configuration for variant selection
   scoringConfig: {

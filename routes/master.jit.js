@@ -54,12 +54,12 @@ router.get('/api/stream/:id/master.m3u8', async (req, res) => {
 
   // 5) build variants
   let variantSet = VARIANTS;
-  if (sourceWidth >= 3840) {
-    variantSet = [
-      { resolution: `${sourceWidth}x${sourceHeight}`, bitrate: '15000k', label: '4k', isSDR: false },
-      ...VARIANTS
-    ];
-  }
+  // if (sourceWidth >= 3840) {
+  //   variantSet = [
+  //     { resolution: `${sourceWidth}x${sourceHeight}`, bitrate: '15000k', label: '4k', isSDR: false },
+  //     ...VARIANTS
+  //   ];
+  // }
 
   // 6) generate
   const masterPlaylist = generateJitMasterPlaylist(
@@ -180,7 +180,7 @@ function generateJitMasterPlaylist(videoId, variantSet, frameRate, { audioGroups
            `CODECS="${codecs}",AUDIO="${groupId}",VIDEO-RANGE=${vr},` +
            `SCORE=${score.toFixed(2)},CLOSED-CAPTIONS=NONE\n`;
 
-      // ◀─ here, ALWAYS call the plain playlist.m3u8
+      // Include the audio group in the playlist path for proper audio pairing
       p += `/api/stream/${videoId}/${variant.label}/playlist_${groupId}.m3u8\n`;
     });
   });

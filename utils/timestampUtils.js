@@ -1,7 +1,10 @@
 // utils/timestampUtils.js
-const { HLS_SEGMENT_TIME } = require('../config/config');
-const { getVideoFps } = require('./ffprobe');
+const path = require('path');
+const fs = require('fs').promises;
+const { HLS_SEGMENT_TIME, HLS_OUTPUT_DIR } = require('../config/config');
+const { getVideoFps, getMediaInfo } = require('./ffprobe');
 const { getOptimalSegmentDuration } = require('./gopUtils');
+const { safeFilename, ensureDir } = require('./files');
 
 // Cache for aligned segment durations to avoid recalculating
 // key: videoId, value: {duration: number, timestamp: number}
@@ -121,23 +124,97 @@ function findNearestKeyframeTimestamp(mediaInfo, timestamp) {
 /**
  * Calculate segment filename from segment number
  * @param {number} segmentNumber - The segment number
- * @returns {string} - Segment filename (e.g., "000.ts")
+ * @param {string} format - Segment format ('ts' or 'm4s')
+ * @returns {string} - Segment filename (e.g., "000.ts" or "000.m4s")
  */
-function segmentNumberToFilename(segmentNumber) {
-  return `${segmentNumber.toString().padStart(3, '0')}.ts`;
+function segmentNumberToFilename(segmentNumber, format = 'ts') {
+  return `${segmentNumber.toString().padStart(3, '0')}.${format}`;
 }
 
 /**
  * Extract segment number from segment filename
- * @param {string} filename - Segment filename (e.g., "000.ts")
+ * @param {string} filename - Segment filename (e.g., "000.ts" or "000.m4s")
  * @returns {number} - The segment number
  */
 function filenameToSegmentNumber(filename) {
-  const match = filename.match(/^(\d+)\.ts$/);
+  const match = filename.match(/^(\d+)\.(ts|m4s)$/);
   if (match) {
     return parseInt(match[1], 10);
   }
   return NaN;
+}
+
+/**
+ * Get segment file extension based on codec
+ * @param {string} codec - Codec name (e.g., 'hevc', 'h264')
+ * @returns {string} - File extension ('m4s' for HEVC, 'ts' for others)
+ */
+function getSegmentExtensionForCodec(codec) {
+  return codec === 'hevc' ? 'm4s' : 'ts';
+}
+
+/**
+ * Precompute and store segment boundaries for a video
+ * @param {string} videoId - Video identifier
+ * @param {string} videoPath - Path to video file
+ * @returns {Promise<Array>} - Array of segment boundary objects
+ */
+async function precomputeSegmentBoundaries(videoId, videoPath) {
+  console.log(`Precomputing segment boundaries for ${videoId}`);
+  
+  // Get media info
+  const mediaInfo = await getMediaInfo(videoPath);
+  const segmentDuration = await getOptimalSegmentDuration(videoPath, HLS_SEGMENT_TIME);
+  const videoStream = mediaInfo.streams.find(s => s.codec_type === 'video');
+  const totalDuration = parseFloat(videoStream.duration || 0);
+  
+  if (!totalDuration) {
+    throw new Error('Unable to determine media duration');
+  }
+  
+  const segmentCount = Math.ceil(totalDuration / segmentDuration);
+  console.log(`Media duration: ${totalDuration}s, segment duration: ${segmentDuration}s, segment count: ${segmentCount}`);
+  
+  const segments = [];
+  
+  for (let i = 0; i < segmentCount; i++) {
+    const startTime = i * segmentDuration;
+    const actualDuration = Math.min(segmentDuration, totalDuration - startTime);
+    
+    segments.push({
+      index: i,
+      runtimeTicks: Math.floor(startTime * 10000000), // Convert to ticks (100ns units)
+      actualSegmentLengthTicks: Math.floor(actualDuration * 10000000),
+      startTimeSeconds: startTime,
+      durationSeconds: actualDuration
+    });
+  }
+  
+  // Store this information for future use
+  const segmentBoundariesDir = path.join(HLS_OUTPUT_DIR, safeFilename(videoId));
+  await ensureDir(segmentBoundariesDir);
+  const boundariesPath = path.join(segmentBoundariesDir, 'segment_boundaries.json');
+  await fs.writeFile(boundariesPath, JSON.stringify(segments, null, 2));
+  
+  return segments;
+}
+
+/**
+ * Get precomputed segment boundaries for a video
+ * @param {string} videoId - Video identifier
+ * @param {string} videoPath - Path to video file (needed if boundaries don't exist yet)
+ * @returns {Promise<Array>} - Array of segment boundary objects
+ */
+async function getSegmentBoundaries(videoId, videoPath) {
+  const boundariesPath = path.join(HLS_OUTPUT_DIR, safeFilename(videoId), 'segment_boundaries.json');
+  
+  try {
+    const data = await fs.readFile(boundariesPath, 'utf8');
+    return JSON.parse(data);
+  } catch (err) {
+    // If boundaries don't exist, compute them now
+    return await precomputeSegmentBoundaries(videoId, videoPath);
+  }
 }
 
 module.exports = {
@@ -147,5 +224,8 @@ module.exports = {
   segmentNumberToFilename,
   filenameToSegmentNumber,
   getAlignedSegmentDuration,
-  timestampToSeconds
+  timestampToSeconds,
+  getSegmentExtensionForCodec,
+  precomputeSegmentBoundaries,
+  getSegmentBoundaries
 };

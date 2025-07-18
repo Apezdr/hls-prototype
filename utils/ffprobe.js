@@ -329,4 +329,57 @@ async function calculateAverageBitrate(variantOutputDir, numSegments = 3) {
   return validSegments > 0 ? Promise.resolve(Math.round(totalBitrate / validSegments)) : Promise.reject(0);
 }
 
-module.exports = { getMediaInfo, getVideoFps, parseFrameRate, determineVideoRange, detectHdrType, determineFfmpegProfile, calculateAverageBitrate };
+/**
+ * Get video duration in seconds using ffprobe
+ * @param {string} videoPath - Path to the video file
+ * @returns {Promise<number>} - Duration in seconds
+ */
+async function getVideoDuration(videoPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'json',
+      videoPath
+    ];
+    
+    console.log(`Getting video duration: ${FFPROBE_PATH} ${args.join(' ')}`);
+    
+    const ffprobe = spawn(FFPROBE_PATH, args);
+    let output = '';
+    
+    ffprobe.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+    
+    ffprobe.stderr.on('data', (data) => {
+      // Ignore stderr output
+    });
+    
+    ffprobe.on('close', (code) => {
+      if (code !== 0) {
+        // Default to 2 hours for error cases
+        console.log(`Error getting duration, defaulting to 2 hours`);
+        return resolve(7200);
+      }
+      
+      try {
+        const result = JSON.parse(output);
+        const duration = parseFloat(result.format.duration);
+        console.log(`Video duration: ${duration} seconds`);
+        resolve(isNaN(duration) ? 7200 : duration);
+      } catch (err) {
+        console.error(`Error parsing duration: ${err.message}`);
+        // Default to 2 hours
+        resolve(7200);
+      }
+    });
+    
+    ffprobe.on('error', (err) => {
+      console.error(`FFprobe error: ${err.message}`);
+      resolve(7200); // Default to 2 hours
+    });
+  });
+}
+
+module.exports = { getMediaInfo, getVideoFps, parseFrameRate, determineVideoRange, detectHdrType, determineFfmpegProfile, calculateAverageBitrate, getVideoDuration };

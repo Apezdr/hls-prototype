@@ -8,3 +8,4 @@ node_modules
 *.env
 /test
 /cline_docs
+/code_references

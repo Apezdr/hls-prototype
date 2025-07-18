@@ -86,16 +86,23 @@ async function acquireSlot({ taskId, priority = 1, metadata = {} }) {
  * Releases a hardware transcoder slot and processes the next item in queue if any.
  *
  * @function releaseSlot
- * @param {string} [taskId] - The task ID that's releasing the slot
+ * @param {string|Object} taskId - The task ID that's releasing the slot, or an object with taskId property
  * @returns {void} No return value.
  */
 function releaseSlot(taskId = undefined) {
   if (currentCount > 0) {
+    // Handle both string taskId and object with taskId property
+    const taskIdentifier = typeof taskId === 'object' && taskId !== null 
+      ? taskId.taskId || 'unknown'
+      : taskId;
+    
     currentCount--;
-    console.log(`Hardware slot released${taskId ? ' by task ' + taskId : ''} (${currentCount}/${MAX_HW_PROCESSES} active)`);
+    console.log(`Hardware slot released${taskIdentifier ? ' by task ' + taskIdentifier : ''} (${currentCount}/${MAX_HW_PROCESSES} active)`);
     
     // Trigger queue processing in case there are pending tasks
     processQueue();
+  } else {
+    console.warn(`Attempted to release hardware slot when count is already at 0`);
   }
 }
 
